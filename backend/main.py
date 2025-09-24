@@ -1,6 +1,10 @@
-from fastapi import Depends
+import pathlib
+import uuid
+import boto3
+from fastapi import Depends, HTTPException,status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 import modal
+import os
 from pydantic import BaseModel
 
 class ProcessVideoRequest(BaseModel):
@@ -33,10 +37,28 @@ class AiPodcastClipper:
         print("Loading models")
         pass
 
+    def transcribe_video(self, base_dir: str, video_path: str) -> str:
+        pass
+
     @modal.fastapi_endpoint(method="POST")
     def process_video(self,request:ProcessVideoRequest,token:HTTPAuthorizationCredentials=Depends(auth_scheme)):
-        print("Processing video "+ request.s3_key)
-        pass
+        s3_key=request.s3_key
+
+        if token.credentials!=os.environ["AUTH_TOKEN"]:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,detail="Incorret bearer token",headers={"WWW-Authenticate":"Bearer"})
+        
+        run_id= str(uuid.uuid4())
+        base_dir=pathlib.Path("/tmp") / run_id
+        base_dir.mkdir(parents=True,exist_ok=True)
+
+        #Download video file
+        video_path = base_dir / "input.mp4"
+        s3_client = boto3.client("s3")
+        s3_client.download_file("ai-podcast-clipper-tool-bucket", s3_key, str(video_path))
+
+
+        print(os.listdir(base_dir))
+        
 
 @app.local_entrypoint()
 def main():
