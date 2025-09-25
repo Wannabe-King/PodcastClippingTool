@@ -1,8 +1,10 @@
+import json
 import pathlib
 import subprocess
 import time
 import uuid
 import boto3
+import botocore
 from fastapi import Depends, HTTPException,status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 import modal
@@ -59,6 +61,40 @@ class AiPodcastClipper:
         duration= time.time() - start_time
 
         print("Transcription and alignment took "+ str(duration) + "seconds")
+        segments=[]
+
+        if "word_segments" in result:
+            for word_segments in result["word_segments"]:
+                segments.append({
+                    "start":word_segments["start"],
+                    "end":word_segments["end"],
+                    "word":word_segments["word"],
+                })
+
+    def donwload_video(self,s3_key: str,base_dir:str) -> str:
+        #Download video file
+        try:
+            video_path = base_dir / "input.mp4"
+            s3_client = boto3.client("s3")
+            s3_client.download_file("ai-podcast-clipper-tool-bucket", s3_key, str(video_path))
+            return video_path
+        except botocore.exceptions.ClientError as error:
+            error_code = error.response['Error']['Code']
+            error_message = error.response['Error']['Message']
+        
+            print(f"S3 Error {error_code}: {error_message}")
+        
+            if error_code == '404':
+                raise HTTPException(status_code=404, detail=f"Video file not found: {s3_key}")
+            elif error_code == '403':
+                raise HTTPException(status_code=403, detail=f"Access denied to video file: {s3_key}")
+            else:
+                raise HTTPException(status_code=500, detail=f"Failed to download video: {error_message}")
+    
+        except Exception as error:
+            print(f"Unexpected error downloading video: {error}")
+            raise HTTPException(status_code=500, detail="Failed to download video from S3")
+
 
     @modal.fastapi_endpoint(method="POST")
     def process_video(self,request:ProcessVideoRequest,token:HTTPAuthorizationCredentials=Depends(auth_scheme)):
@@ -66,15 +102,12 @@ class AiPodcastClipper:
 
         if token.credentials!=os.environ["AUTH_TOKEN"]:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,detail="Incorret bearer token",headers={"WWW-Authenticate":"Bearer"})
-        
+
         run_id= str(uuid.uuid4())
         base_dir=pathlib.Path("/tmp") / run_id
         base_dir.mkdir(parents=True,exist_ok=True)
 
-        #Download video file
-        video_path = base_dir / "input.mp4"
-        s3_client = boto3.client("s3")
-        s3_client.download_file("ai-podcast-clipper-tool-bucket", s3_key, str(video_path))
+        video_path= self.donwload_video(s3_key,base_dir)
 
         self.transcribe_video(base_dir,video_path)
         print(os.listdir(base_dir))
@@ -96,4 +129,4 @@ def main():
 
     response= requests.post(url,json=payload,headers=headers)
     result=response.json()
-    print(response)
+    print(result)
