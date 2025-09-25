@@ -1,5 +1,6 @@
 import json
 import pathlib
+import shutil
 import subprocess
 import time
 import uuid
@@ -11,6 +12,7 @@ import modal
 import os
 from pydantic import BaseModel
 import whisperx
+from google import genai
 
 class ProcessVideoRequest(BaseModel):
      s3_key:str
@@ -35,6 +37,21 @@ mount_path="/root/.cache/torch"
 
 auth_scheme= HTTPBearer()
 
+def process_clip(base_dir: str, original_video_path: str, s3_key: str, start_time: float, end_time: float, clip_index: int, transcript_segments: list):
+    clip_name=f"clip_{clip_index}"
+    s3_key_dir= os.path.dirname(s3_key)
+    output_s3_key= f"{s3_key_dir}/{clip_name}.mp4"
+    print("Output s3 key: {output_s3_key}")
+
+    clip_dir = base_dir / clip_name
+    clip_dir.mk_dir(parents=True, exist_ok=True)
+
+    #Segment path: original clip from start to end time
+    clip_segment_path= clip
+
+
+
+
 @app.cls(gpu="L40S",timeout=900,retries=0,scaledown_window=20,secrets=[modal.Secret.from_name("ai-podcast-clipper-secret")],volumes={mount_path:volume})
 class AiPodcastClipper:
     @modal.enter()
@@ -44,6 +61,10 @@ class AiPodcastClipper:
 
         self.alignment_model,self.metadata=whisperx.load_align_model(language_code="en",device="cuda")
         print("Transcription models loaded ...")
+
+        print("Creating gemini client...")
+        self.gemini_client= genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+        print("Created gemini client...")
 
     def transcribe_video(self, base_dir: str, video_path: str) -> str:
         audio_path= base_dir / "audio.wav"
@@ -72,7 +93,7 @@ class AiPodcastClipper:
                 })
 
     def donwload_video(self,s3_key: str,base_dir:str) -> str:
-        #Download video file
+        
         try:
             video_path = base_dir / "input.mp4"
             s3_client = boto3.client("s3")
@@ -95,11 +116,37 @@ class AiPodcastClipper:
             print(f"Unexpected error downloading video: {error}")
             raise HTTPException(status_code=500, detail="Failed to download video from S3")
 
+    def identify_moments(self,transcript: dict):
+        response = self.gemini_client.models.generate_content(model="gemini-2.5-flash-preview", contents="""
+    This is a podcast video transcript consisting of word, along with each words's start and end time. I am looking to create clips between a minimum of 30 and maximum of 60 seconds long. The clip should never exceed 60 seconds.
+
+    Your task is to find and extract stories, or question and their corresponding answers from the transcript.
+    Each clip should begin with the question and conclude with the answer.
+    It is acceptable for the clip to include a few additional sentences before a question if it aids in contextualizing the question.
+
+    Please adhere to the following rules:
+    - Ensure that clips do not overlap with one another.
+    - Start and end timestamps of the clips should align perfectly with the sentence boundaries in the transcript.
+    - Only use the start and end timestamps provided in the input. modifying timestamps is not allowed.
+    - Format the output as a list of JSON objects, each representing a clip with 'start' and 'end' timestamps: [{"start": seconds, "end": seconds}, ...clip2, clip3]. The output should always be readable by the python json.loads function.
+    - Aim to generate longer clips between 40-60 seconds, and ensure to include as much content from the context as viable.
+
+    Avoid including:
+    - Moments of greeting, thanking, or saying goodbye.
+    - Non-question and answer interactions.
+
+    If there are no valid clips to extract, the output should be an empty list [], in JSON format. Also readable by json.loads() in Python.
+
+    The transcript is as follows:\n\n""" + str(transcript))
+        print(f"Identified moments response: ${response.text}")
+        return response.text
+
 
     @modal.fastapi_endpoint(method="POST")
     def process_video(self,request:ProcessVideoRequest,token:HTTPAuthorizationCredentials=Depends(auth_scheme)):
         s3_key=request.s3_key
-
+        
+        #Step 1: Authenticate Request
         if token.credentials!=os.environ["AUTH_TOKEN"]:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,detail="Incorret bearer token",headers={"WWW-Authenticate":"Bearer"})
 
@@ -107,11 +154,39 @@ class AiPodcastClipper:
         base_dir=pathlib.Path("/tmp") / run_id
         base_dir.mkdir(parents=True,exist_ok=True)
 
+        #Step 2: Download video file
         video_path= self.donwload_video(s3_key,base_dir)
 
-        self.transcribe_video(base_dir,video_path)
-        print(os.listdir(base_dir))
+        #Step 3: Transcription
+        transcript_segment_json = self.transcribe_video(base_dir,video_path)
+        transcript_segment= json.loads(transcript_segment_json)
         
+        #Step 4: Indentify moments for clips
+        identified_moments_raw = self.identify_moments(transcript_segment)
+        cleaned_json_string = identified_moments_raw.strip()
+        if cleaned_json_string.startswith("```json"):
+            cleaned_json_string = cleaned_json_string[len("```json"):].strip()
+        if cleaned_json_string.endswith("```"):
+            cleaned_json_string = cleaned_json_string[:-len("```")].strip()
+
+        clip_moments= json.loads(cleaned_json_string)
+        if not clip_moments or not isinstance(clip_moments, list):
+            print("Error: Identified moments is not a list")
+            clip_moments = []
+
+        print(clip_moments)
+
+        #Step 5: Process Clips
+        for index, moment in enumerate(clip_moments[:3]):
+            if "start" in moment and "end" in moment:
+                print("Processing clip" + str(index) + " from " + str(moment["start"]) + " to "+ str(moment["end"]))
+                process_clip(base_dir, video_path, s3_key, moment["start"], moment["end"], index, transcript_segment)
+
+        if base_dir.exists():
+            print("Cleaning up tem dir after "+base_dir)
+            shutil.rmtree(base_dir,ignore_errors=True)
+
+
 
 @app.local_entrypoint()
 def main():
