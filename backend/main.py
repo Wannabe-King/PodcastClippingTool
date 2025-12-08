@@ -1,5 +1,6 @@
 import json
 import pathlib
+import pickle
 import shutil
 import subprocess
 import time
@@ -27,7 +28,7 @@ image=(modal.Image.from_registry(
                       .add_local_dir("asd","/asd",copy=True))
 
 
-app=modal.App("backend",image=image)
+app=modal.App("ai-podcast-clipper",image=image)
 
 volume= modal.Volume.from_name(
     "ai-podcast-clipper-model-cache",create_if_missing=True
@@ -44,11 +45,75 @@ def process_clip(base_dir: str, original_video_path: str, s3_key: str, start_tim
     print("Output s3 key: {output_s3_key}")
 
     clip_dir = base_dir / clip_name
-    clip_dir.mk_dir(parents=True, exist_ok=True)
+    clip_dir.mkdir(parents=True, exist_ok=True)
 
     #Segment path: original clip from start to end time
-    clip_segment_path= clip
+    clip_segment_path= clip_dir / f"{clip_name}_segment.mp4"
+    vertical_mp4_path= clip_dir / "pyavi" / "video_out_vertical.mp4"
+    subtitle_ouput_path= clip_dir / "pyavi" / "video_with_subtitles.mp4"
 
+    (clip_dir / "pywork").mkdir(exist_ok=True)
+    pyframes_path = clip_dir / "pyframes"
+    pyavi_path = clip_dir / "pyavi"
+    audio_path = clip_dir / "pyavi" / "audio.wav"
+
+    pyframes_path.mkdir(exist_ok=True)
+    pyavi_path.mkdir(exist_ok=True)
+
+    duration = end_time - start_time
+    # command to cut video into the clip from start_time to end_time
+    cut_command = (f"ffmpeg -i {original_video_path} -ss {start_time} -t {duration} "
+                   f"{clip_segment_path}")
+    subprocess.run(cut_command, shell=True, check=True,
+                   capture_output=True, text=True)
+    
+    # command to extract audio from the clipped segment
+    extract_cmd = f"ffmpeg -i {clip_segment_path} -vn -acodec pcm_s16le -ar 16000 -ac 1 {audio_path}"
+    subprocess.run(extract_cmd, shell=True,
+                   check=True, capture_output=True)
+    
+
+    # copy the clip to base directory for processing from colombia asd model
+    shutil.copy(clip_segment_path, base_dir / f"{clip_name}.mp4")
+
+    # asd columbia command for active speaker detection -> outputs tracks and scores in pickel format
+    # pickel is just a json object to store python object
+    columbia_command = (f"python Columbia_test.py --videoName {clip_name} "
+                        f"--videoFolder {str(base_dir)} "
+                        f"--pretrainModel weight/finetuning_TalkSet.model")
+    
+    columbia_start_time = time.time()
+    subprocess.run(columbia_command, cwd="/asd", shell=True)
+    columbia_end_time = time.time()
+    print(
+        f"Columbia script completed in {columbia_end_time - columbia_start_time:.2f} seconds")
+    
+    tracks_path = clip_dir / "pywork" / "tracks.pckl"
+    scores_path = clip_dir / "pywork" / "scores.pckl"
+    if not tracks_path.exists() or not scores_path.exists():
+        raise FileNotFoundError("Tracks or scores not found for clip")
+
+    # open both tracks and scores file and load them into memory
+    with open(tracks_path, "rb") as f:
+        tracks = pickle.load(f)
+
+    with open(scores_path, "rb") as f:
+        scores = pickle.load(f)
+
+    # cvv_start_time = time.time()
+    # create_vertical_video(
+    #     tracks, scores, pyframes_path, pyavi_path, audio_path, vertical_mp4_path
+    # )
+    # cvv_end_time = time.time()
+    # print(
+    #     f"Clip {clip_index} vertical video creation time: {cvv_end_time - cvv_start_time:.2f} seconds")
+
+    # create_subtitles_with_ffmpeg(transcript_segments, start_time,
+    #                              end_time, vertical_mp4_path, subtitle_output_path, max_words=5)
+
+    # s3_client = boto3.client("s3")
+    # s3_client.upload_file(
+    #     subtitle_output_path, "ai-podcast-clipper", output_s3_key)
 
 
 
@@ -56,7 +121,7 @@ def process_clip(base_dir: str, original_video_path: str, s3_key: str, start_tim
 class AiPodcastClipper:
     @modal.enter()
     def load_model(self):
-        print("Loading models")
+        # Loading whisperX model
         self.whisperx_model=whisperx.load_model("large-v2",device="cuda",compute_type="float16")
 
         self.alignment_model,self.metadata=whisperx.load_align_model(language_code="en",device="cuda")
@@ -77,11 +142,20 @@ class AiPodcastClipper:
         audio= whisperx.load_audio(audio_path)
         result= self.whisperx_model.transcribe(audio, batch_size=16)
 
-        result = whisperx.align(result["segments"],self.alignment_model,self.metadata,audio,device="cuda",return_char_alignments=False)
+        # Align: synchronizing the recognized text segments with the audio at a more precise level
+        result = whisperx.align(
+            result["segments"],
+            self.alignment_model,
+            self.metadata,
+            audio,
+            device="cuda",
+            return_char_alignments=False
+        )
 
         duration= time.time() - start_time
 
         print("Transcription and alignment took "+ str(duration) + "seconds")
+        
         segments=[]
 
         if "word_segments" in result:
@@ -91,6 +165,8 @@ class AiPodcastClipper:
                     "end":word_segments["end"],
                     "word":word_segments["word"],
                 })
+
+        return json.dumps(segments)
 
     def donwload_video(self,s3_key: str,base_dir:str) -> str:
         
@@ -154,14 +230,18 @@ class AiPodcastClipper:
         base_dir=pathlib.Path("/tmp") / run_id
         base_dir.mkdir(parents=True,exist_ok=True)
 
-        #Step 2: Download video file
-        video_path= self.donwload_video(s3_key,base_dir)
+        # #Step 2: Download video file
+        # video_path= self.donwload_video(s3_key,base_dir)
+        video_path=base_dir / "input.mp4"
+        s3_client= boto3.client("s3")
+        s3_client.download_file("ai-podcast-clipper-tool-bucket",s3_key,str(video_path))
 
-        #Step 3: Transcription
+        # #Step 3: Transcription
         transcript_segment_json = self.transcribe_video(base_dir,video_path)
         transcript_segment= json.loads(transcript_segment_json)
         
-        #Step 4: Indentify moments for clips
+        # #Step 4: Indentify moments for clips
+        print("Identifying clip moments")
         identified_moments_raw = self.identify_moments(transcript_segment)
         cleaned_json_string = identified_moments_raw.strip()
         if cleaned_json_string.startswith("```json"):
@@ -176,7 +256,7 @@ class AiPodcastClipper:
 
         print(clip_moments)
 
-        #Step 5: Process Clips
+        # #Step 5: Process Clips
         for index, moment in enumerate(clip_moments[:3]):
             if "start" in moment and "end" in moment:
                 print("Processing clip" + str(index) + " from " + str(moment["start"]) + " to "+ str(moment["end"]))
