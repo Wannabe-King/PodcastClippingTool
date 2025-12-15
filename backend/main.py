@@ -1,3 +1,4 @@
+import glob
 import json
 import pathlib
 import pickle
@@ -7,11 +8,15 @@ import time
 import uuid
 import boto3
 import botocore
+import cv2
 from fastapi import Depends, HTTPException,status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+import ffmpegcv
 import modal
 import os
+import numpy as np
 from pydantic import BaseModel
+from tqdm import tqdm
 import whisperx
 from google import genai
 
@@ -37,6 +42,130 @@ volume= modal.Volume.from_name(
 mount_path="/root/.cache/torch"
 
 auth_scheme= HTTPBearer()
+
+def create_vertical_video(tracks, scores, pyframes_path, pyavi_path, audio_path, output_path, framerate=25):
+    target_width=1080
+    target_height=1920
+
+    # Search for all the jpg files and return the path list
+    flist=glob.glob(os.path.join(pyframes_path,"*.jpg"))
+    flist.sort()
+
+    # Loop through frames and create a list of faces and their position
+    faces=[[] for _ in range(len(flist))]
+
+    # Looping trough tracks
+    for tidx, track in enumerate(tracks):
+        score_array= scores[tidx]
+        # Looping through scores in tracks
+        for fidx, frame in enumerate(track["track"]["frame"].tolist()):
+            slice_start = max(fidx -30, 0)
+            slice_end = min(fidx + 30, len(score_array))
+            score_slice = score_array[slice_start:slice_end]
+            # avg the score across the 30 frame window
+            avg_score = float(np.mean(score_slice)
+                              if len(score_slice) > 0 else 0)
+
+            faces[frame].append(
+                {'track': tidx, 'score': avg_score, 's': track['proc_track']["s"][fidx], 'x': track['proc_track']["x"][fidx], 'y': track['proc_track']["y"][fidx]})
+
+    temp_video_path = os.path.join(pyavi_path, "video_only.mp4")
+
+    vout = None
+    # tqdm is used to create progress bars
+    for fidx, fname in tqdm(enumerate(flist), total=len(flist), desc="Creating vertical video"):
+        img = cv2.imread(fname)
+        if img is None:
+            continue
+        
+        # find the list of current faces in the frame
+        current_faces = faces[fidx]
+
+        # find the max score face or in no face exist in frame return None
+        max_score_face = max(
+            current_faces, key=lambda face: face['score']) if current_faces else None
+
+        if max_score_face and max_score_face['score'] < 0:
+            max_score_face = None
+
+        # writing the vertical video
+        if vout is None:
+            vout = ffmpegcv.VideoWriterNV(
+                file=temp_video_path,
+                codec=None,
+                fps=framerate,
+                resize=(target_width, target_height)
+            )
+
+        # If thier are faces present in the frame then crop mode else resize mode
+        if max_score_face:
+            mode = "crop"
+        else:
+            mode = "resize"
+
+        # resize mode
+        if mode == "resize":
+            # finding the scale to resize the image
+            scale = target_width / img.shape[1]
+            resized_height = int(img.shape[0] * scale)
+            # resizing the image
+            resized_image = cv2.resize(
+                img, (target_width, resized_height), interpolation=cv2.INTER_AREA)
+
+            # creating a blur background from the original video
+            scale_for_bg = max(
+                target_width / img.shape[1], target_height / img.shape[0])
+            bg_width = int(img.shape[1] * scale_for_bg)
+            bg_heigth = int(img.shape[0] * scale_for_bg)
+
+            blurred_background = cv2.resize(img, (bg_width, bg_heigth))
+            # blurring the bg
+            blurred_background = cv2.GaussianBlur(
+                blurred_background, (121, 121), 0)
+
+            crop_x = (bg_width - target_width) // 2
+            crop_y = (bg_heigth - target_height) // 2
+            blurred_background = blurred_background[crop_y:crop_y +
+                                                    target_height, crop_x:crop_x + target_width]
+
+            center_y = (target_height - resized_height) // 2
+            blurred_background[center_y:center_y +
+                               resized_height, :] = resized_image
+
+            vout.write(blurred_background)
+
+        # crop mode
+        elif mode == "crop":
+            # scaling image size based on if its bigger or smaller than target height
+            scale = target_height / img.shape[0]
+            resized_image = cv2.resize(
+                img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+            frame_width = resized_image.shape[1]
+
+            # finding the position where we have to crop the image
+            center_x = int(
+                max_score_face["x"] * scale if max_score_face else frame_width // 2)
+            
+            # starting position of the crop window without going out of bound
+            top_x = max(min(center_x - target_width // 2,
+                        frame_width - target_width), 0)
+
+            # crop image
+            image_cropped = resized_image[0:target_height,
+                                          top_x:top_x + target_width]
+
+            vout.write(image_cropped)
+    
+    if vout:
+        vout.release()
+
+    # combining vertical video with audio
+    ffmpeg_command = (f"ffmpeg -y -i {temp_video_path} -i {audio_path} "
+                      f"-c:v h264 -preset fast -crf 23 -c:a aac -b:a 128k "
+                      f"{output_path}")
+    subprocess.run(ffmpeg_command, shell=True, check=True, text=True)
+
+
 
 def process_clip(base_dir: str, original_video_path: str, s3_key: str, start_time: float, end_time: float, clip_index: int, transcript_segments: list):
     clip_name=f"clip_{clip_index}"
@@ -100,20 +229,22 @@ def process_clip(base_dir: str, original_video_path: str, s3_key: str, start_tim
     with open(scores_path, "rb") as f:
         scores = pickle.load(f)
 
-    # cvv_start_time = time.time()
-    # create_vertical_video(
-    #     tracks, scores, pyframes_path, pyavi_path, audio_path, vertical_mp4_path
-    # )
-    # cvv_end_time = time.time()
-    # print(
-    #     f"Clip {clip_index} vertical video creation time: {cvv_end_time - cvv_start_time:.2f} seconds")
+    # create verticle video using the given frames
+    cvv_start_time = time.time()
+    create_vertical_video(
+        tracks, scores, pyframes_path, pyavi_path, audio_path, vertical_mp4_path
+    )
+    cvv_end_time = time.time()
+    print(
+        f"Clip {clip_index} vertical video creation time: {cvv_end_time - cvv_start_time:.2f} seconds")
 
     # create_subtitles_with_ffmpeg(transcript_segments, start_time,
     #                              end_time, vertical_mp4_path, subtitle_output_path, max_words=5)
 
-    # s3_client = boto3.client("s3")
-    # s3_client.upload_file(
-    #     subtitle_output_path, "ai-podcast-clipper", output_s3_key)
+    # upload the video to s3
+    s3_client = boto3.client("s3",aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"])
+    s3_client.upload_file(
+        vertical_mp4_path, "ai-podcast-clipper-tool-bucket", output_s3_key)
 
 
 
@@ -193,7 +324,7 @@ class AiPodcastClipper:
             raise HTTPException(status_code=500, detail="Failed to download video from S3")
 
     def identify_moments(self,transcript: dict):
-        response = self.gemini_client.models.generate_content(model="gemini-2.5-flash-preview", contents="""
+        response = self.gemini_client.models.generate_content(model="gemini-2.5-flash-preview-09-2025", contents="""
     This is a podcast video transcript consisting of word, along with each words's start and end time. I am looking to create clips between a minimum of 30 and maximum of 60 seconds long. The clip should never exceed 60 seconds.
 
     Your task is to find and extract stories, or question and their corresponding answers from the transcript.
@@ -226,6 +357,7 @@ class AiPodcastClipper:
         if token.credentials!=os.environ["AUTH_TOKEN"]:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,detail="Incorret bearer token",headers={"WWW-Authenticate":"Bearer"})
 
+
         run_id= str(uuid.uuid4())
         base_dir=pathlib.Path("/tmp") / run_id
         base_dir.mkdir(parents=True,exist_ok=True)
@@ -233,7 +365,7 @@ class AiPodcastClipper:
         # #Step 2: Download video file
         # video_path= self.donwload_video(s3_key,base_dir)
         video_path=base_dir / "input.mp4"
-        s3_client= boto3.client("s3")
+        s3_client= boto3.client("s3",aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"])
         s3_client.download_file("ai-podcast-clipper-tool-bucket",s3_key,str(video_path))
 
         # #Step 3: Transcription
@@ -257,13 +389,14 @@ class AiPodcastClipper:
         print(clip_moments)
 
         # #Step 5: Process Clips
-        for index, moment in enumerate(clip_moments[:3]):
+        # here we decide how many clips/moments to process
+        for index, moment in enumerate(clip_moments[:1]):
             if "start" in moment and "end" in moment:
                 print("Processing clip" + str(index) + " from " + str(moment["start"]) + " to "+ str(moment["end"]))
                 process_clip(base_dir, video_path, s3_key, moment["start"], moment["end"], index, transcript_segment)
 
         if base_dir.exists():
-            print("Cleaning up tem dir after "+base_dir)
+            print("Cleaning up tem dir after ${base_dir}")
             shutil.rmtree(base_dir,ignore_errors=True)
 
 
