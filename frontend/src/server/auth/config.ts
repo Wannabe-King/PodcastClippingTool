@@ -1,5 +1,8 @@
 import { PrismaAdapter } from "@auth/prisma-adapter";
 import { type DefaultSession, type NextAuthConfig } from "next-auth";
+import CredentialProvider from "next-auth/providers/credentials";
+import { email } from "zod/v4";
+import { comparePasswords } from "~/lib/auth";
 
 import { db } from "~/server/db";
 
@@ -31,16 +34,47 @@ declare module "next-auth" {
  */
 export const authConfig = {
   providers: [
-    /**
-     * ...add more providers here.
-     *
-     * Most other providers require a bit more work than the Discord provider. For example, the
-     * GitHub provider requires you to add the `refresh_token_expires_in` field to the Account
-     * model. Refer to the NextAuth.js docs for the provider you want to use. Example:
-     *
-     * @see https://next-auth.js.org/providers/github
-     */
+    CredentialProvider({
+      name: "credentials",
+      credentials: {
+        email: {
+          label: "Email",
+          type: "email",
+        },
+        password: {
+          label: "Password",
+          type: "password",
+        },
+      },
+      async authorize(credentials) {
+        if (!credentials?.email || !credentials?.password) {
+          return null;
+        }
+
+        const email = credentials.email as string;
+        const password = credentials.password as string;
+
+        const user = await db.user.findUnique({
+          where: {
+            email,
+          },
+        });
+
+        if (!user) {
+          return null;
+        }
+
+        const passwordMatch = await comparePasswords(password, user.password);
+
+        if (!passwordMatch) {
+          return null;
+        }
+
+        return user;
+      },
+    }),
   ],
+  session: { strategy: "jwt" },
   adapter: PrismaAdapter(db),
   callbacks: {
     session: ({ session, user }) => ({
@@ -50,5 +84,11 @@ export const authConfig = {
         id: user.id,
       },
     }),
+    jwt:({token,user})=>{
+      if(user){
+        token.id=user.id;
+      }
+      return token;
+    }
   },
 } satisfies NextAuthConfig;
