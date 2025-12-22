@@ -20,13 +20,14 @@ import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useState } from "react";
 import { useRouter } from "next/navigation";
-import { signupSchema, type SignupFormValues } from "~/schemas/auth";
+import { loginSchema, type LoginFormValues } from "~/schemas/auth";
 import { signUp } from "~/actions/auth";
 
 import Link from "next/link";
 import { signIn } from "next-auth/react";
+import { email } from "zod/v4";
 
-export function SignupForm({
+export function LoginForm({
   className,
   ...props
 }: React.ComponentProps<"div">) {
@@ -38,27 +39,21 @@ export function SignupForm({
     register,
     handleSubmit,
     formState: { errors },
-  } = useForm<SignupFormValues>({ resolver: zodResolver(signupSchema) });
+  } = useForm<LoginFormValues>({ resolver: zodResolver(loginSchema) });
 
-  const onSubmit = async (data: SignupFormValues) => {
+  const onSubmit = async (data: LoginFormValues) => {
     try {
       setIsSubmitting(true);
       setError(null);
-      const result = await signUp(data);
-      if (!result.success) {
-        setError(result.error ?? "An error occured during signup");
-        return;
-      }
-      const signUpResult = await signIn("credentials", {
+
+      const signInResult = await signIn("credentials", {
         email: data.email,
         password: data.password,
         redirect: false,
       });
 
-      if (signUpResult?.error) {
-        setError(
-          "Account created but couldn't sign in automatically. Please try again.",
-        );
+      if (signInResult?.error) {
+        setError("Invalid email or password.");
       } else {
         router.push("/dashboard");
       }
@@ -73,9 +68,9 @@ export function SignupForm({
     <div className={cn("flex flex-col gap-6", className)} {...props}>
       <Card>
         <CardHeader>
-          <CardTitle>Sign up</CardTitle>
+          <CardTitle>Login</CardTitle>
           <CardDescription>
-            Enter your email below to sign up to your account
+            Enter your email below to login to your account
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -106,7 +101,9 @@ export function SignupForm({
                   {...register("password")}
                 />
                 {errors.password && (
-                  <p className="text-sm text-red-500">{errors.password.message}</p>
+                  <p className="text-sm text-red-500">
+                    {errors.password.message}
+                  </p>
                 )}
               </Field>
               {error && (
@@ -120,13 +117,14 @@ export function SignupForm({
                   className="w-full"
                   disabled={isSubmitting}
                 >
-                  {isSubmitting ? "Signing up..." : "Sign up"}
+                  {isSubmitting ? "Logging In..." : "Login"}
                 </Button>
                 {/* <Button variant="outline" type="button">
                   Login with Google
                 </Button> */}
                 <FieldDescription className="text-center">
-                  Alerady have an account? <Link href="/login">Sign in</Link>
+                  Don&apos;t have an account?{" "}
+                  <Link href="/signup">Sign Up</Link>
                 </FieldDescription>
               </Field>
             </FieldGroup>
