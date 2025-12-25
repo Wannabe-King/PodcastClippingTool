@@ -25,7 +25,6 @@ import { signUp } from "~/actions/auth";
 
 import Link from "next/link";
 import { signIn } from "next-auth/react";
-import { email } from "zod/v4";
 
 export function LoginForm({
   className,
