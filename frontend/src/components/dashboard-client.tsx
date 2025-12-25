@@ -27,7 +27,7 @@ import {
 } from "./ui/table";
 import { Badge } from "./ui/badge";
 import { useRouter } from "next/navigation";
-// import { ClipDisplay } from "./clip-display";
+import { ClipDisplay } from "./clip-display";
 
 export function DashboardClient({
   uploadedFiles,
@@ -277,7 +277,7 @@ export function DashboardClient({
               </CardDescription>
             </CardHeader>
             <CardContent>
-              {/* <ClipDisplay clips={clips} /> */}
+              <ClipDisplay clips={clips} />
             </CardContent>
           </Card>
         </TabsContent>
