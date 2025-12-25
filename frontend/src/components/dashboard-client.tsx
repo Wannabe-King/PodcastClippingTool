@@ -16,7 +16,7 @@ import { Loader2, UploadCloud } from "lucide-react";
 import { useState } from "react";
 import { generateUploadUrl } from "~/actions/s3";
 import { toast } from "sonner";
-// import { processVideo } from "~/actions/generation";
+import { processVideo } from "~/actions/generation";
 import {
   Table,
   TableBody,
@@ -71,20 +71,22 @@ export function DashboardClient({
           contentType: file.type,
         });
 
-      //   if (!success) throw new Error("Failed to get upload URL");
+        if (!success) throw new Error("Failed to get upload URL");
 
-      //   const uploadResponse = await fetch(signedUrl, {
-      //     method: "PUT",
-      //     body: file,
-      //     headers: {
-      //       "Content-Type": file.type,
-      //     },
-      //   });
+        // Uploading the video
+        const uploadResponse = await fetch(signedUrl, {
+          method: "PUT",
+          body: file,
+          headers: {
+            "Content-Type": file.type,
+          },
+        });
 
-      //   if (!uploadResponse.ok)
-      //     throw new Error(`Upload filed with status: ${uploadResponse.status}`);
+        if (!uploadResponse.ok)
+          throw new Error(`Upload filed with status: ${uploadResponse.status}`);
 
-      //   await processVideo(uploadedFileId);
+        // Processing the uploaded video
+        await processVideo(uploadedFileId);
 
       setFiles([]);
 
